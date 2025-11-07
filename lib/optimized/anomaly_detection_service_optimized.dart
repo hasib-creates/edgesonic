@@ -61,19 +61,23 @@ class AnomalyDetectionServiceOptimized {
         File(modelPath),
         options: options,
       );
-      
-      // Verify model input/output shapes
-      final inputShape = _interpreter.getInputTensor(0).shape;
-      final outputShape = _interpreter.getOutputTensor(0).shape; // reconstruction
-      
+
+      // Verify model input/output shapes and types
+      final inputTensor = _interpreter.getInputTensor(0);
+      final outputTensor = _interpreter.getOutputTensor(0);
+      final inputShape = inputTensor.shape;
+      final outputShape = outputTensor.shape;
+      final inputType = inputTensor.type;
+      final outputType = outputTensor.type;
+
       print('Model loaded successfully:');
-      print('  Input shape: $inputShape');
-      print('  Output shape: $outputShape');
+      print('  Input shape: $inputShape, type: $inputType');
+      print('  Output shape: $outputShape, type: $outputType');
       print('  Threshold: ${threshold.toStringAsFixed(4)}');
-      
+
       // Warm-up inference
       await _runWarmup();
-      
+
       _isLoaded = true;
       return true;
     } catch (e) {
@@ -87,21 +91,44 @@ class AnomalyDetectionServiceOptimized {
   Future<void> _runWarmup() async {
     try {
       print('Running warm-up inference...');
-      final dummyInput = List.generate(
-        1,
-        (_) => List.generate(
-          AudioConfig.numMelBins,
-          (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
-        ),
-      );
 
-      final dummyOutput = List.generate(
-        1,
-        (_) => List.generate(
-          AudioConfig.numMelBins,
-          (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
-        ),
-      );
+      // Get input/output tensor info
+      final inputTensor = _interpreter.getInputTensor(0);
+      final outputTensor = _interpreter.getOutputTensor(0);
+      final inputType = inputTensor.type;
+      final outputType = outputTensor.type;
+
+      print('  Warmup using input type: $inputType, output type: $outputType');
+
+      // Create dummy input based on tensor type
+      dynamic dummyInput;
+      dynamic dummyOutput;
+
+      if (inputType.toString().contains('int8')) {
+        // For INT8 quantized model, use Int8List
+        final inputSize = 1 * AudioConfig.numMelBins * AudioConfig.targetLength;
+        dummyInput = Int8List(inputSize);
+
+        // Output shape from logs: [1, 128, 8]
+        final outputSize = outputTensor.shape.reduce((a, b) => a * b);
+        dummyOutput = Int8List(outputSize);
+      } else {
+        // For float32 model
+        dummyInput = List.generate(
+          1,
+          (_) => List.generate(
+            AudioConfig.numMelBins,
+            (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
+          ),
+        );
+        dummyOutput = List.generate(
+          1,
+          (_) => List.generate(
+            AudioConfig.numMelBins,
+            (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
+          ),
+        );
+      }
 
       _stopwatch.start();
       _interpreter.run(dummyInput, dummyOutput);
@@ -124,28 +151,87 @@ class AnomalyDetectionServiceOptimized {
 
     _stopwatch.start();
 
-    // Prepare output buffer (reconstruction)
-    // Note: tflite_flutter handles quantization/dequantization automatically
-    final outputTensor = List.generate(
-      1,
-      (_) => List.generate(
+    // Get tensor info
+    final inputTensorInfo = _interpreter.getInputTensor(0);
+    final outputTensorInfo = _interpreter.getOutputTensor(0);
+    final inputType = inputTensorInfo.type;
+
+    dynamic modelInput;
+    dynamic modelOutput;
+    List<List<double>> dequantizedOutput;
+
+    if (inputType.toString().contains('int8')) {
+      // INT8 quantized model - need to quantize input
+      final inputParams = inputTensorInfo.params;
+      final inputScale = inputParams.scale;
+      final inputZeroPoint = inputParams.zeroPoint;
+
+      print('Input quantization: scale=$inputScale, zeroPoint=$inputZeroPoint');
+
+      // Flatten and quantize input: [1, 16, 128] -> Int8List
+      final inputSize = 1 * AudioConfig.numMelBins * AudioConfig.targetLength;
+      modelInput = Int8List(inputSize);
+
+      int idx = 0;
+      for (int b = 0; b < 1; b++) {
+        for (int m = 0; m < AudioConfig.numMelBins; m++) {
+          for (int f = 0; f < AudioConfig.targetLength; f++) {
+            final floatVal = inputTensor[b][m][f];
+            final quantizedVal = (floatVal / inputScale + inputZeroPoint).round().clamp(-128, 127);
+            modelInput[idx++] = quantizedVal;
+          }
+        }
+      }
+
+      // Prepare output buffer
+      final outputSize = outputTensorInfo.shape.reduce((a, b) => a * b);
+      modelOutput = Int8List(outputSize);
+
+      // Run inference
+      _interpreter.run(modelInput, modelOutput);
+
+      // Dequantize output
+      final outputParams = outputTensorInfo.params;
+      final outputScale = outputParams.scale;
+      final outputZeroPoint = outputParams.zeroPoint;
+
+      print('Output quantization: scale=$outputScale, zeroPoint=$outputZeroPoint');
+
+      // Output shape is [1, 128, 8] but we need [16, 128] for MSE with input [16, 128]
+      // Need to reshape and transpose appropriately
+      dequantizedOutput = List.generate(
         AudioConfig.numMelBins,
         (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
-      ),
-    );
+      );
 
-    // Run inference (tflite_flutter handles INT8 quantization automatically)
-    _interpreter.run(inputTensor, outputTensor);
+      // Dequantize: output_float = (output_int8 - zeroPoint) * scale
+      idx = 0;
+      for (int i = 0; i < modelOutput.length && idx < AudioConfig.numMelBins * AudioConfig.targetLength; i++) {
+        final int m = idx ~/ AudioConfig.targetLength;
+        final int f = idx % AudioConfig.targetLength;
+        if (m < AudioConfig.numMelBins && f < AudioConfig.targetLength) {
+          dequantizedOutput[m][f] = (modelOutput[i] - outputZeroPoint) * outputScale;
+          idx++;
+        }
+      }
+    } else {
+      // Float32 model
+      final outputTensor = List.generate(
+        1,
+        (_) => List.generate(
+          AudioConfig.numMelBins,
+          (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
+        ),
+      );
 
-    // Check if we need to transpose output to match input format
-    // Python implementation transposes from (1, 16, 128) to (1, 128, 16)
-    // But in Dart, our input is [1, 16, 128] and output should match
-    // tflite_flutter typically returns in the same format as model output
+      _interpreter.run(inputTensor, outputTensor);
+      dequantizedOutput = outputTensor[0];
+    }
 
     // Calculate MSE loss (matches Python: torch.mean((input - recon) ** 2))
     // Input format: [batch=1, mels=16, frames=128]
     // Output format should match for MSE calculation
-    double rawScore = _calculateMSE(inputTensor[0], outputTensor[0]);
+    double rawScore = _calculateMSE(inputTensor[0], dequantizedOutput);
 
     // Apply smoothing (matches Python exactly)
     double smoothedScore;
