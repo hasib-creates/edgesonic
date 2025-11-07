@@ -112,10 +112,11 @@ class AnomalyDetectionServiceOptimized {
     if (!_isLoaded) {
       throw StateError('Model not loaded. Call loadModel() first.');
     }
-    
+
     _stopwatch.start();
-    
+
     // Prepare output buffer (reconstruction)
+    // Note: tflite_flutter handles quantization/dequantization automatically
     final outputTensor = List.generate(
       1,
       (_) => List.generate(
@@ -123,37 +124,44 @@ class AnomalyDetectionServiceOptimized {
         (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
       ),
     );
-    
-    // Run inference
+
+    // Run inference (tflite_flutter handles INT8 quantization automatically)
     _interpreter.run(inputTensor, outputTensor);
-    
+
+    // Check if we need to transpose output to match input format
+    // Python implementation transposes from (1, 16, 128) to (1, 128, 16)
+    // But in Dart, our input is [1, 16, 128] and output should match
+    // tflite_flutter typically returns in the same format as model output
+
     // Calculate MSE loss (matches Python: torch.mean((input - recon) ** 2))
+    // Input format: [batch=1, mels=16, frames=128]
+    // Output format should match for MSE calculation
     double rawScore = _calculateMSE(inputTensor[0], outputTensor[0]);
-    
+
     // Apply smoothing (matches Python exactly)
     double smoothedScore;
     if (_scoreHistory.isNotEmpty) {
-      smoothedScore = smoothingAlpha * rawScore + 
+      smoothedScore = smoothingAlpha * rawScore +
                       (1 - smoothingAlpha) * _scoreHistory.last;
     } else {
       smoothedScore = rawScore;
     }
-    
+
     // Update history
     _scoreHistory.add(rawScore);
     if (_scoreHistory.length > maxHistoryLength) {
       _scoreHistory.removeAt(0);
     }
-    
+
     // Determine anomaly
     bool isAnomaly = smoothedScore > threshold;
-    
+
     _stopwatch.stop();
     final processingTimeMs = _stopwatch.elapsedMicroseconds / 1000.0;
     _totalInferences++;
     _totalInferenceTimeMs += processingTimeMs;
     _stopwatch.reset();
-    
+
     return AnomalyResult(
       rawScore: rawScore,
       smoothedScore: smoothedScore,
