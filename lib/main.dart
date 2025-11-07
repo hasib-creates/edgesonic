@@ -1,13 +1,12 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:fl_chart/fl_chart.dart';
-import 'services/anomaly_detection_service.dart';
-import 'services/live_audio_service.dart';
-import 'services/audio_processing_service.dart';
+import 'dart:typed_data';
+
+import '../optimized/anomaly_detection_service_optimized.dart';
+import '../optimized/audio_processing_service_optimized.dart';
+import 'services/live_audio_service_optimized.dart';
 import 'pages/mqtt_test_page.dart';
 import 'pages/mqtt_simulator_page.dart';
 
@@ -22,10 +21,20 @@ class EdgeSonicApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'EdgeSonic Anomaly Detection',
+      title: 'EdgeSonic',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.teal,
+          brightness: Brightness.light,
+        ),
         useMaterial3: true,
+        cardTheme: CardTheme(
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: BorderSide(color: Colors.grey.shade200),
+          ),
+        ),
       ),
       debugShowCheckedModeBanner: false,
       home: const EdgeSonicHomePage(),
@@ -40,281 +49,43 @@ class EdgeSonicHomePage extends StatefulWidget {
   State<EdgeSonicHomePage> createState() => _EdgeSonicHomePageState();
 }
 
-class _EdgeSonicHomePageState extends State<EdgeSonicHomePage> {
-  final AnomalyDetectionService _detectionService = AnomalyDetectionService();
-  final LiveAudioService _liveAudioService = LiveAudioService();
+class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
+    with SingleTickerProviderStateMixin {
+  final AnomalyDetectionServiceOptimized _detector =
+      AnomalyDetectionServiceOptimized();
+  final LiveAudioServiceOptimized _liveAudioService =
+      LiveAudioServiceOptimized();
   StreamSubscription<LiveAudioChunk>? _liveSubscription;
 
+  late TabController _tabController;
+
+  // Model state
   bool _modelLoaded = false;
   bool _isLoadingModel = false;
-  bool _isProcessing = false;
-  String _modelSourceLabel = 'Asset';
-  String? _customModelPath;
-  bool _metadataLoaded = false;
-  String? _metadataStatus;
+  String? _loadError;
+
+  // File processing state
   String? _selectedFilePath;
   String? _selectedFileName;
-  double _processingProgress = 0.0;
-  List<AnomalyDetectionResult>? _results;
-  String? _errorMessage;
-  String? _lastExportPath;
-  String? _exportError;
+  bool _isProcessingFile = false;
+  double _fileProgress = 0.0;
+  List<AnomalyResult>? _fileResults;
+  String? _fileError;
+
+  // Live inference state
   bool _isLiveRunning = false;
   bool _liveInferenceInProgress = false;
   int _liveChunksProcessed = 0;
-  double? _liveRms;
-  double? _liveMelMean;
-  double? _liveMelStd;
-  DateTime? _lastLiveChunkTime;
+  AnomalyResult? _latestLiveResult;
   String? _liveError;
-  AnomalyDetectionResult? _latestLiveResult;
+  double? _liveRms;
+  DateTime? _lastLiveChunkTime;
 
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 3, vsync: this);
     _loadModel();
-  }
-
-  Widget _buildLiveAudioCard(BuildContext context) {
-    final theme = Theme.of(context);
-    final statusColor = _isLiveRunning ? Colors.green : Colors.grey;
-    final statusText =
-        _isLiveRunning ? 'Streaming from microphone' : 'Idle';
-    final lastChunkTime = _lastLiveChunkTime != null
-        ? TimeOfDay.fromDateTime(_lastLiveChunkTime!).format(context)
-        : '—';
-    final liveResult = _latestLiveResult;
-    final bool hasLiveResult = liveResult != null;
-    final String anomalyText;
-    final Color anomalyColor;
-    if (!hasLiveResult) {
-      anomalyText = 'Awaiting inference';
-      anomalyColor = theme.colorScheme.onSurfaceVariant;
-    } else if (liveResult!.isAnomaly) {
-      anomalyText = 'Anomaly detected';
-      anomalyColor = Colors.red;
-    } else {
-      anomalyText = 'Normal';
-      anomalyColor = Colors.green;
-    }
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  _isLiveRunning ? Icons.mic : Icons.mic_off,
-                  color: statusColor,
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  'Live Microphone (beta)',
-                  style: theme.textTheme.titleMedium,
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              statusText,
-              style: theme.textTheme.bodySmall,
-            ),
-            if (hasLiveResult) ...[
-              const SizedBox(height: 4),
-              Text(
-                anomalyText,
-                style: theme.textTheme.bodySmall?.copyWith(color: anomalyColor),
-              ),
-            ],
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 16,
-              runSpacing: 12,
-              children: [
-                _buildLiveStat(context, 'Windows', '$_liveChunksProcessed'),
-                _buildLiveStat(
-                  context,
-                  'RMS',
-                  _liveRms != null ? _liveRms!.toStringAsFixed(4) : '—',
-                ),
-                _buildLiveStat(
-                  context,
-                  'Mel mean',
-                  _liveMelMean != null ? _liveMelMean!.toStringAsFixed(4) : '—',
-                ),
-                _buildLiveStat(
-                  context,
-                  'Mel std',
-                  _liveMelStd != null ? _liveMelStd!.toStringAsFixed(4) : '—',
-                ),
-                _buildLiveStat(
-                  context,
-                  'Last chunk',
-                  lastChunkTime,
-                ),
-                if (hasLiveResult) ...[
-                  _buildLiveStat(
-                    context,
-                    'MSE',
-                    liveResult!.rawScore.toStringAsFixed(4),
-                    subtitle: 'thr ${liveResult.threshold.toStringAsFixed(4)}',
-                    valueColor: liveResult.isAnomaly ? Colors.red : null,
-                  ),
-                  if (_metadataLoaded && !liveResult.svddScore.isNaN)
-                    _buildLiveStat(
-                      context,
-                      'SVDD',
-                      liveResult.svddScore.toStringAsFixed(4),
-                      subtitle: 'thr ${liveResult.svddThreshold.toStringAsFixed(4)}',
-                      valueColor: liveResult.isSvddAnomaly ? Colors.red : null,
-                    ),
-                  _buildLiveStat(
-                    context,
-                    'Latency',
-                    liveResult.inferenceDuration != null
-                        ? '${liveResult.inferenceDuration!.inMilliseconds} ms'
-                        : '—',
-                  ),
-                ],
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                FilledButton.icon(
-                  onPressed: () async {
-                    await _toggleLiveCapture();
-                  },
-                  icon: Icon(_isLiveRunning ? Icons.stop : Icons.play_arrow),
-                  label: Text(_isLiveRunning ? 'Stop Capture' : 'Start Capture'),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    'Captures 16 kHz PCM and prepares Mel windows (16×128) for the TFLite model.',
-                    style: theme.textTheme.bodySmall,
-                  ),
-                ),
-              ],
-            ),
-            if (_liveError != null) ...[
-              const SizedBox(height: 12),
-              DecoratedBox(
-                decoration: BoxDecoration(
-                  color: Colors.red.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Text(
-                    _liveError!,
-                    style: TextStyle(color: Colors.red.shade700),
-                  ),
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildLiveStat(
-    BuildContext context,
-    String label,
-    String value, {
-    String? subtitle,
-    Color? valueColor,
-  }) {
-    final theme = Theme.of(context);
-    return SizedBox(
-      width: 140,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            label,
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurface.withOpacity(0.6),
-            ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            value,
-            style: theme.textTheme.titleMedium?.copyWith(color: valueColor),
-          ),
-          if (subtitle != null) ...[
-            const SizedBox(height: 2),
-            Text(
-              subtitle,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _buildMqttToolsCard(BuildContext context) {
-    final theme = Theme.of(context);
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.router, color: theme.colorScheme.primary),
-                const SizedBox(width: 8),
-                Text(
-                  'MQTT Tools',
-                  style: theme.textTheme.titleMedium,
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Connect to your broker, send telemetry, or emulate the ESP32 payloads.',
-              style: theme.textTheme.bodySmall,
-            ),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const MqttTestPage()),
-                      );
-                    },
-                    icon: const Icon(Icons.wifi_tethering),
-                    label: const Text('MQTT Test'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(builder: (_) => const MqttSimulatorPage()),
-                      );
-                    },
-                    icon: const Icon(Icons.sensors),
-                    label: const Text('ESP32 Simulator'),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
   }
 
   @override
@@ -322,152 +93,46 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage> {
     _liveSubscription?.cancel();
     unawaited(_liveAudioService.stop());
     _liveAudioService.dispose();
-    _detectionService.dispose();
+    _detector.dispose();
+    _tabController.dispose();
     super.dispose();
   }
 
-  Future<void> _loadModel({String? filePath}) async {
+  Future<void> _loadModel() async {
     setState(() {
       _isLoadingModel = true;
-      _errorMessage = null;
+      _loadError = null;
     });
 
-    final bool loaded = filePath == null
-        ? await _detectionService.loadModel()
-        : await _detectionService.loadModelFromFile(filePath);
-
-    bool metadataLoaded = false;
-    String? metadataStatus;
-
-    if (loaded) {
-      if (filePath == null) {
-        metadataLoaded =
-            await _detectionService.loadMetadataFromAsset('assets/models/model_metadata.json');
-        metadataLoaded = metadataLoaded && _detectionService.hasSvddCenter;
-        metadataStatus = metadataLoaded
-            ? 'SVDD center length: ${_detectionService.svddCenterLength}'
-            : 'SVDD scoring disabled (no metadata found). MSE scoring still works.';
-      } else {
-        _detectionService.setMetadata(ModelMetadata.defaults());
-        metadataLoaded = false;
-        metadataStatus = 'Custom model loaded. SVDD scoring disabled unless metadata is provided.';
-      }
-    } else {
-      metadataStatus = null;
+    try {
+      final loaded = await _detector.loadModel();
+      if (!mounted) return;
+      setState(() {
+        _modelLoaded = loaded;
+        _isLoadingModel = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _modelLoaded = false;
+        _isLoadingModel = false;
+        _loadError = e.toString();
+      });
     }
-
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _isLoadingModel = false;
-      _modelLoaded = loaded;
-      _modelSourceLabel = _detectionService.modelSource;
-      _customModelPath = filePath;
-      _metadataLoaded = metadataLoaded;
-      _metadataStatus = metadataStatus;
-
-      if (!loaded) {
-        final details = _detectionService.lastError ?? 'Unknown error';
-        _errorMessage =
-            'Failed to load model. Confirm the TensorFlow Lite runtime is available.\n$details';
-      }
-    });
   }
 
   Future<void> _pickAudioFile() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.audio,
+      allowMultiple: false,
     );
 
     if (result != null && result.files.single.path != null) {
       setState(() {
         _selectedFilePath = result.files.single.path;
         _selectedFileName = result.files.single.name;
-        _results = null;
-      });
-    }
-  }
-
-  Future<void> _pickModelFile() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['tflite'],
-    );
-    final path = result?.files.single.path;
-    if (path == null) {
-      return;
-    }
-    await _loadModel(filePath: path);
-  }
-
-  Future<void> _pickMetadataFile() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['json'],
-    );
-    final path = result?.files.single.path;
-    if (path == null) {
-      return;
-    }
-    final success = await _detectionService.loadMetadataFromFile(path);
-    if (!mounted) {
-      return;
-    }
-    setState(() {
-      _metadataLoaded = success && _detectionService.hasSvddCenter;
-      _metadataStatus = _metadataLoaded
-          ? 'SVDD center length: ${_detectionService.svddCenterLength}'
-          : 'Metadata load failed or missing svdd_center. SVDD scoring disabled.';
-    });
-  }
-
-  Future<void> _processAudioFile() async {
-    if (_selectedFilePath == null || !_modelLoaded) return;
-
-    setState(() {
-      _isProcessing = true;
-      _processingProgress = 0.0;
-      _errorMessage = null;
-      _exportError = null;
-      _lastExportPath = null;
-    });
-
-    try {
-      final results = await _detectionService.processAudioFile(
-        _selectedFilePath!,
-        onProgress: (progress) {
-          setState(() {
-            _processingProgress = progress;
-          });
-        },
-      );
-
-      File? exportFile;
-      String? exportError;
-      try {
-        final hopSeconds = AudioProcessingService.hopSamples / AudioConfig.sampleRate;
-        exportFile = await _detectionService.exportResultsToCsv(
-          results: results,
-          inputFileName: _selectedFileName ?? 'audio_clip',
-          hopSeconds: hopSeconds,
-        );
-      } catch (e) {
-        exportError = 'Failed to export CSV: $e';
-      }
-
-      setState(() {
-        _results = results;
-        _isProcessing = false;
-        _lastExportPath = exportFile?.path;
-        _exportError = exportError;
-      });
-    } catch (e) {
-      setState(() {
-        _errorMessage = 'Error processing audio: $e';
-        _isProcessing = false;
-        _lastExportPath = null;
-        _exportError = null;
+        _fileResults = null;
+        _fileError = null;
       });
     }
   }
@@ -481,34 +146,33 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage> {
   }
 
   Future<void> _startLiveCapture() async {
-    setState(() {
-      _liveError = null;
-    });
-
-    final result = await _liveAudioService.start();
-    if (!mounted) {
+    if (!_modelLoaded) {
+      setState(() => _liveError = 'Model not loaded');
       return;
     }
+
+    setState(() => _liveError = null);
+
+    final result = await _liveAudioService.start();
+    if (!mounted) return;
 
     if (!result.started) {
       setState(() {
         _isLiveRunning = false;
-        _liveError = result.error ?? 'Unable to start live audio capture.';
+        _liveError = result.error ?? 'Failed to start';
       });
       return;
     }
 
+    _detector.clearBuffer();
+    _detector.resetMetrics();
+
     await _liveSubscription?.cancel();
     _liveSubscription = _liveAudioService.chunks.listen(
-      (chunk) {
+      _handleLiveChunk,
+      onError: (error) {
         if (!mounted) return;
-        _handleLiveChunk(chunk);
-      },
-      onError: (Object error) {
-        if (!mounted) return;
-        setState(() {
-          _liveError = 'Live audio error: $error';
-        });
+        setState(() => _liveError = 'Error: $error');
         unawaited(_stopLiveCapture());
       },
     );
@@ -516,12 +180,10 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage> {
     setState(() {
       _isLiveRunning = true;
       _liveChunksProcessed = 0;
-      _liveRms = null;
-      _liveMelMean = null;
-      _liveMelStd = null;
-      _lastLiveChunkTime = null;
       _latestLiveResult = null;
       _liveInferenceInProgress = false;
+      _liveRms = null;
+      _lastLiveChunkTime = null;
     });
   }
 
@@ -529,67 +191,37 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage> {
     await _liveSubscription?.cancel();
     _liveSubscription = null;
     await _liveAudioService.stop();
-    if (!mounted) {
-      return;
-    }
+    if (!mounted) return;
     setState(() {
       _isLiveRunning = false;
       _liveInferenceInProgress = false;
-      _latestLiveResult = null;
-    });
-  }
-
-  void _updateLiveStats(LiveAudioChunk chunk) {
-    double sum = 0.0;
-    double sumSq = 0.0;
-    int count = 0;
-
-    for (final row in chunk.melSpectrogram) {
-      for (final value in row) {
-        sum += value;
-        sumSq += value * value;
-        count += 1;
-      }
-    }
-
-    final mean = count == 0 ? 0.0 : sum / count;
-    final variance = count == 0 ? 0.0 : (sumSq / count) - (mean * mean);
-    final stdDev = variance <= 0 ? 0.0 : math.sqrt(variance);
-
-    setState(() {
-      _liveChunksProcessed = _liveAudioService.chunksProcessed;
-      _liveRms = chunk.rms;
-      _liveMelMean = mean;
-      _liveMelStd = stdDev;
-      _lastLiveChunkTime = chunk.timestamp;
     });
   }
 
   void _handleLiveChunk(LiveAudioChunk chunk) {
-    _updateLiveStats(chunk);
-    if (!_modelLoaded || _liveInferenceInProgress) {
-      return;
+    setState(() {
+      _liveChunksProcessed = _liveAudioService.chunksProcessed;
+      _liveRms = chunk.rms;
+      _lastLiveChunkTime = chunk.timestamp;
+    });
+
+    if (!_liveInferenceInProgress) {
+      _liveInferenceInProgress = true;
+      unawaited(_runLiveInference(chunk));
     }
-    _liveInferenceInProgress = true;
-    unawaited(_runLiveInference(chunk));
   }
 
   Future<void> _runLiveInference(LiveAudioChunk chunk) async {
     try {
-      final result = await _detectionService.detectAnomalyFromPreparedInput(
-        chunk.modelInput,
-        timestamp: chunk.timestamp,
-      );
+      final result = await _detector.processAudioChunk(chunk.samples);
       if (!mounted) return;
       setState(() {
         _latestLiveResult = result;
         _liveError = null;
       });
-    } catch (error) {
+    } catch (e) {
       if (!mounted) return;
-      setState(() {
-        _liveError = 'Live inference error: $error';
-      });
+      setState(() => _liveError = 'Inference error: $e');
     } finally {
       _liveInferenceInProgress = false;
     }
@@ -599,416 +231,518 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('EdgeSonic Anomaly Detection'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-      ),
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: ListView(
-            children: [
-              // Model Status Card
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Icon(
-                            _modelLoaded ? Icons.check_circle : Icons.error,
-                            color: _modelLoaded ? Colors.green : Colors.red,
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            _modelLoaded
-                                ? 'Model Loaded Successfully'
-                                : 'Model Not Loaded',
-                            style: Theme.of(context).textTheme.titleMedium,
-                          ),
-                          if (_isLoadingModel) ...[
-                            const SizedBox(width: 8),
-                            const SizedBox(
-                              height: 16,
-                              width: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            ),
-                          ],
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Source: $_modelSourceLabel',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      Text(
-                        'Model file: ${_customModelPath ?? 'assets/models/tcn_model_int8.tflite'}',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      Text(
-                        'MSE threshold: ${_detectionService.threshold.toStringAsFixed(4)}',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      if (_metadataLoaded)
-                        Text(
-                          'SVDD threshold: ${_detectionService.svddThreshold.toStringAsFixed(4)}',
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                      if (_metadataStatus != null) ...[
-                        const SizedBox(height: 8),
-                        Text(
-                          _metadataStatus!,
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                      ],
-                      const SizedBox(height: 12),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          FilledButton.icon(
-                            onPressed: _isLoadingModel ? null : () => _loadModel(),
-                            icon: const Icon(Icons.refresh),
-                            label: const Text('Reload asset'),
-                          ),
-                          OutlinedButton.icon(
-                            onPressed: _isLoadingModel ? null : _pickModelFile,
-                            icon: const Icon(Icons.file_open),
-                            label: const Text('Load .tflite'),
-                          ),
-                          OutlinedButton.icon(
-                            onPressed: (!_modelLoaded || _isLoadingModel) ? null : _pickMetadataFile,
-                            icon: const Icon(Icons.data_object),
-                            label: const Text('Load metadata'),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-              const SizedBox(height: 16),
-
-              _buildLiveAudioCard(context),
-
-              const SizedBox(height: 16),
-
-              // File Selection
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Audio File',
-                        style: Theme.of(context).textTheme.titleMedium,
-                      ),
-                      const SizedBox(height: 8),
-                      if (_selectedFileName != null) ...[
-                        Row(
-                          children: [
-                            const Icon(Icons.audio_file),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                _selectedFileName!,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                      ],
-                      Row(
-                        children: [
-                          ElevatedButton.icon(
-                            onPressed: _isProcessing ? null : _pickAudioFile,
-                            icon: const Icon(Icons.folder_open),
-                            label: const Text('Select Audio File'),
-                          ),
-                          const SizedBox(width: 8),
-                          ElevatedButton.icon(
-                            onPressed: (_selectedFilePath != null &&
-                                _modelLoaded &&
-                                !_isProcessing)
-                                ? _processAudioFile
-                                : null,
-                            icon: const Icon(Icons.play_arrow),
-                            label: const Text('Process'),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-              // Processing Progress
-              if (_isProcessing) ...[
-                const SizedBox(height: 16),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Processing: ${(_processingProgress * 100).toStringAsFixed(1)}%',
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                        const SizedBox(height: 8),
-                        LinearProgressIndicator(value: _processingProgress),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-
-              // Results
-              if (_results != null && _results!.isNotEmpty) ...[
-                const SizedBox(height: 16),
-                SizedBox(
-                  height: 320,
-                  child: Card(
-                    child: Padding(
-                      padding: const EdgeInsets.all(16.0),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Anomaly Detection Results',
-                            style: Theme.of(context).textTheme.titleMedium,
-                          ),
-                          const SizedBox(height: 8),
-                          _buildStatistics(),
-                          const SizedBox(height: 16),
-                          Expanded(
-                            child: _buildChart(),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-
-              if (_lastExportPath != null || _exportError != null) ...[
-                const SizedBox(height: 16),
-                _buildExportStatusCard(context),
-              ],
-
-              // Error Message
-              if (_errorMessage != null) ...[
-                const SizedBox(height: 16),
-                Card(
-                  color: Colors.red.shade50,
-                  child: Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Text(
-                      _errorMessage!,
-                      style: TextStyle(color: Colors.red.shade900),
-                    ),
-                  ),
-                ),
-              ],
-
-              const SizedBox(height: 16),
-
-              _buildMqttToolsCard(context),
-            ],
+        title: const Text('EdgeSonic'),
+        centerTitle: true,
+        elevation: 0,
+        actions: [
+          IconButton(
+            icon: Icon(_modelLoaded ? Icons.check_circle : Icons.error_outline),
+            color: _modelLoaded ? Colors.green : Colors.red,
+            onPressed: _isLoadingModel ? null : _loadModel,
+            tooltip: _modelLoaded ? 'Model Ready' : 'Tap to reload',
           ),
+        ],
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(icon: Icon(Icons.mic), text: 'Live'),
+            Tab(icon: Icon(Icons.upload_file), text: 'File'),
+            Tab(icon: Icon(Icons.router), text: 'MQTT'),
+          ],
         ),
       ),
-    );
-  }
-
-  Widget _buildStatistics() {
-    if (_results == null || _results!.isEmpty) return Container();
-
-    final scores = _results!.map((r) => r.smoothedScore).toList();
-    final minScore = scores.reduce((a, b) => a < b ? a : b);
-    final maxScore = scores.reduce((a, b) => a > b ? a : b);
-    final avgScore = scores.reduce((a, b) => a + b) / scores.length;
-    final anomalyCount = _results!.where((r) => r.isAnomaly).length;
-    final svddValues = _results!
-        .map((r) => r.svddScore)
-        .where((value) => !value.isNaN)
-        .toList();
-    double? minSvdd;
-    double? maxSvdd;
-    double? avgSvdd;
-    if (svddValues.isNotEmpty) {
-      minSvdd = svddValues.reduce((a, b) => a < b ? a : b);
-      maxSvdd = svddValues.reduce((a, b) => a > b ? a : b);
-      avgSvdd = svddValues.reduce((a, b) => a + b) / svddValues.length;
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text('Min Score: ${minScore.toStringAsFixed(6)}'),
-        Text('Max Score: ${maxScore.toStringAsFixed(6)}'),
-        Text('Avg Score: ${avgScore.toStringAsFixed(6)}'),
-        Text('Anomalies Detected: $anomalyCount / ${_results!.length}'),
-        if (minSvdd != null) ...[
-          Text('SVDD Min: ${minSvdd.toStringAsFixed(4)}'),
-          Text('SVDD Max: ${maxSvdd!.toStringAsFixed(4)}'),
-          Text('SVDD Avg: ${avgSvdd!.toStringAsFixed(4)}'),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _buildLiveTab(),
+          _buildFileTab(),
+          _buildMqttTab(),
         ],
-      ],
+      ),
     );
   }
 
-  Widget _buildExportStatusCard(BuildContext context) {
+  // ========== LIVE TAB ==========
+  Widget _buildLiveTab() {
     final theme = Theme.of(context);
-    final success = _lastExportPath != null;
-    final statusIcon = success ? Icons.check_circle : Icons.info;
-    final statusColor = success ? Colors.green : Colors.orange;
-    final statusText = success
-        ? 'CSV export saved here:'
-        : 'CSV export unavailable.';
+    final result = _latestLiveResult;
+    final isAnomaly = result?.isAnomaly ?? false;
 
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Status Card
+          Card(
+            color: _isLiveRunning
+                ? (isAnomaly ? Colors.red.shade50 : Colors.green.shade50)
+                : null,
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                children: [
+                  Icon(
+                    _isLiveRunning ? Icons.mic : Icons.mic_off,
+                    size: 64,
+                    color: _isLiveRunning
+                        ? (isAnomaly ? Colors.red : Colors.green)
+                        : Colors.grey,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    _isLiveRunning ? 'LISTENING' : 'STOPPED',
+                    style: theme.textTheme.headlineSmall?.copyWith(
+                      fontWeight: FontWeight.bold,
+                      color: _isLiveRunning
+                          ? (isAnomaly ? Colors.red : Colors.green)
+                          : Colors.grey,
+                    ),
+                  ),
+                  if (result != null && _isLiveRunning) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      isAnomaly ? '⚠️ ANOMALY DETECTED' : '✓ Normal',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        color: isAnomaly ? Colors.red : Colors.green,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          // Metrics Grid
+          if (_isLiveRunning) ...[
             Row(
               children: [
-                Icon(statusIcon, color: statusColor),
-                const SizedBox(width: 8),
-                Text(
-                  statusText,
-                  style: theme.textTheme.titleMedium,
+                Expanded(
+                  child: _buildMetricCard(
+                    'Chunks',
+                    '$_liveChunksProcessed',
+                    Icons.analytics,
+                    Colors.blue,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _buildMetricCard(
+                    'RMS',
+                    _liveRms?.toStringAsFixed(3) ?? '---',
+                    Icons.graphic_eq,
+                    Colors.purple,
+                  ),
                 ),
               ],
             ),
-            const SizedBox(height: 8),
-            if (success)
-              SelectableText(
-                _lastExportPath!,
-                style: theme.textTheme.bodySmall,
-              ),
-            if (_exportError != null) ...[
-              SelectableText(
-                _exportError!,
-                style: theme.textTheme.bodySmall?.copyWith(color: Colors.orange.shade700),
+            const SizedBox(height: 12),
+            if (result != null) ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildMetricCard(
+                      'Score',
+                      result.smoothedScore.toStringAsFixed(4),
+                      Icons.score,
+                      isAnomaly ? Colors.red : Colors.green,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _buildMetricCard(
+                      'Latency',
+                      '${result.processingTimeMs.toStringAsFixed(1)}ms',
+                      Icons.speed,
+                      Colors.orange,
+                    ),
+                  ),
+                ],
               ),
             ],
-            if (success) ...[
-              const SizedBox(height: 8),
-              Text(
-                'Pull with adb: adb pull "${_lastExportPath!}" ./android_results/',
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: theme.colorScheme.onSurfaceVariant,
+            const SizedBox(height: 20),
+          ],
+
+          // Control Button
+          FilledButton.icon(
+            onPressed: _modelLoaded ? _toggleLiveCapture : null,
+            icon: Icon(_isLiveRunning ? Icons.stop : Icons.play_arrow),
+            label: Text(
+              _isLiveRunning ? 'Stop Capture' : 'Start Live Capture',
+              style: const TextStyle(fontSize: 16),
+            ),
+            style: FilledButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              backgroundColor: _isLiveRunning ? Colors.red : null,
+            ),
+          ),
+
+          // Error Display
+          if (_liveError != null) ...[
+            const SizedBox(height: 16),
+            Card(
+              color: Colors.red.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    Icon(Icons.error, color: Colors.red.shade700),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _liveError!,
+                        style: TextStyle(color: Colors.red.shade700),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-            ],
+            ),
+          ],
+
+          // Info Card
+          if (!_isLiveRunning && _liveError == null) ...[
+            const SizedBox(height: 16),
+            Card(
+              color: Colors.blue.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.info_outline, color: Colors.blue.shade700),
+                        const SizedBox(width: 8),
+                        Text(
+                          'How it works',
+                          style: TextStyle(
+                            color: Colors.blue.shade700,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '• Captures audio at 16kHz\n'
+                      '• Analyzes 128-frame windows\n'
+                      '• Detects anomalies in real-time\n'
+                      '• 5-15ms latency',
+                      style: TextStyle(
+                        color: Colors.blue.shade700,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMetricCard(String label, String value, IconData icon, Color color) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            Icon(icon, color: color, size: 28),
+            const SizedBox(height: 8),
+            Text(
+              value,
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                color: Colors.grey.shade600,
+              ),
+            ),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildChart() {
-    if (_results == null || _results!.isEmpty) {
-      return const Center(child: Text('No data to display'));
-    }
-
-    final spots = _results!
-        .asMap()
-        .entries
-        .map((entry) => FlSpot(
-      entry.value.timeSeconds ?? entry.key.toDouble(),
-      entry.value.smoothedScore,
-    ))
-        .toList();
-
-    final threshold = _detectionService.threshold;
-
-    return LineChart(
-      LineChartData(
-        gridData: const FlGridData(show: true),
-        titlesData: FlTitlesData(
-          leftTitles: AxisTitles(
-            sideTitles: SideTitles(
-              showTitles: true,
-              reservedSize: 40,
-              getTitlesWidget: (value, meta) {
-                return Text(value.toStringAsFixed(3));
-              },
+  // ========== FILE TAB ==========
+  Widget _buildFileTab() {
+    final theme = Theme.of(context);
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // File Selection Card
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.audio_file, color: theme.colorScheme.primary),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Audio File Processing',
+                        style: theme.textTheme.titleLarge,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  if (_selectedFileName != null) ...[
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade100,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.audio_file, size: 20),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _selectedFileName!,
+                              style: const TextStyle(fontWeight: FontWeight.w500),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+                  FilledButton.icon(
+                    onPressed: _isProcessingFile ? null : _pickAudioFile,
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text('Select Audio File'),
+                    style: FilledButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                  ),
+                  if (_selectedFilePath != null) ...[
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      onPressed: null, // TODO: Implement file processing
+                      icon: const Icon(Icons.play_arrow),
+                      label: const Text('Process (Coming Soon)'),
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
             ),
           ),
-          bottomTitles: AxisTitles(
-            axisNameWidget: const Text('Time (s)'),
-            sideTitles: SideTitles(
-              showTitles: true,
-              reservedSize: 30,
-              getTitlesWidget: (value, meta) {
-                return Text(value.toStringAsFixed(1));
-              },
+
+          if (_isProcessingFile) ...[
+            const SizedBox(height: 16),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  children: [
+                    CircularProgressIndicator(value: _fileProgress),
+                    const SizedBox(height: 12),
+                    Text('Processing: ${(_fileProgress * 100).toStringAsFixed(0)}%'),
+                  ],
+                ),
+              ),
             ),
-          ),
-          topTitles: const AxisTitles(
-            sideTitles: SideTitles(showTitles: false),
-          ),
-          rightTitles: const AxisTitles(
-            sideTitles: SideTitles(showTitles: false),
-          ),
-        ),
-        borderData: FlBorderData(show: true),
-        lineBarsData: [
-          // Anomaly scores line
-          LineChartBarData(
-            spots: spots,
-            isCurved: true,
-            color: Colors.blue,
-            barWidth: 2,
-            isStrokeCapRound: true,
-            dotData: const FlDotData(show: false),
-            belowBarData: BarAreaData(
-              show: true,
-              color: Colors.blue.withOpacity(0.1),
+          ],
+
+          if (_fileError != null) ...[
+            const SizedBox(height: 16),
+            Card(
+              color: Colors.orange.shade50,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    Icon(Icons.info, color: Colors.orange.shade700),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _fileError!,
+                        style: TextStyle(color: Colors.orange.shade700),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
-          ),
-          // Threshold line
-          LineChartBarData(
-            spots: [
-              FlSpot(spots.first.x, threshold),
-              FlSpot(spots.last.x, threshold),
-            ],
-            isCurved: false,
-            color: Colors.red,
-            barWidth: 2,
-            isStrokeCapRound: true,
-            dotData: const FlDotData(show: false),
-            dashArray: [5, 5],
+          ],
+
+          // Info Card
+          const SizedBox(height: 16),
+          Card(
+            color: Colors.blue.shade50,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.info_outline, color: Colors.blue.shade700),
+                      const SizedBox(width: 8),
+                      Text(
+                        'File Processing',
+                        style: TextStyle(
+                          color: Colors.blue.shade700,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Upload audio files to analyze for anomalies offline. '
+                    'Results will be displayed with timestamps and exportable to CSV.',
+                    style: TextStyle(
+                      color: Colors.blue.shade700,
+                      fontSize: 13,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
-        lineTouchData: LineTouchData(
-          touchTooltipData: LineTouchTooltipData(
-            getTooltipColor: (touchedSpot) => Colors.blueGrey.withOpacity(0.8),
-            getTooltipItems: (List<LineBarSpot> touchedBarSpots) {
-              return touchedBarSpots.map((barSpot) {
-                final isThreshold = barSpot.barIndex == 1;
-                if (isThreshold) {
-                  return const LineTooltipItem(
-                    'Threshold',
-                    TextStyle(color: Colors.red),
-                  );
-                }
-                return LineTooltipItem(
-                  'Score: ${barSpot.y.toStringAsFixed(4)}\nTime: ${barSpot.x.toStringAsFixed(1)}s',
-                  const TextStyle(color: Colors.white),
-                );
-              }).toList();
-            },
+      ),
+    );
+  }
+
+  // ========== MQTT TAB ==========
+  Widget _buildMqttTab() {
+    final theme = Theme.of(context);
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.router, color: theme.colorScheme.primary, size: 32),
+                      const SizedBox(width: 12),
+                      Text(
+                        'MQTT Integration',
+                        style: theme.textTheme.titleLarge,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    'Connect to your MQTT broker to receive telemetry '
+                    'or simulate ESP32 device payloads.',
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                  const SizedBox(height: 20),
+                  FilledButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (_) => const MqttTestPage()),
+                      );
+                    },
+                    icon: const Icon(Icons.wifi_tethering),
+                    label: const Text('MQTT Connection Test'),
+                    style: FilledButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (_) => const MqttSimulatorPage()),
+                      );
+                    },
+                    icon: const Icon(Icons.sensors),
+                    label: const Text('ESP32 Simulator'),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
-        ),
+
+          const SizedBox(height: 16),
+
+          // Features Card
+          Card(
+            color: Colors.green.shade50,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.check_circle, color: Colors.green.shade700),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Features',
+                        style: TextStyle(
+                          color: Colors.green.shade700,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  _buildFeatureItem('Connect to any MQTT broker'),
+                  _buildFeatureItem('Subscribe to topics'),
+                  _buildFeatureItem('Publish anomaly results'),
+                  _buildFeatureItem('Simulate ESP32 telemetry'),
+                  _buildFeatureItem('Real-time message monitoring'),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFeatureItem(String text) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Icon(Icons.check, color: Colors.green.shade700, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(color: Colors.green.shade700),
+            ),
+          ),
+        ],
       ),
     );
   }
