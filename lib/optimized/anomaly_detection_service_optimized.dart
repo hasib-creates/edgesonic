@@ -58,20 +58,21 @@ class AnomalyDetectionServiceOptimized {
     try {
       final options = InterpreterOptions()..threads = 2;
 
-      // Try to load from file first, fallback to asset
-      try {
+      // Check if it's a file path (starts with /) or asset path
+      if (modelPath.startsWith('/')) {
+        // File system path - load directly
         _interpreter = await Interpreter.fromFile(
           File(modelPath),
           options: options,
         );
-      } catch (e) {
-        print('Failed to load from file, trying asset: $e');
+      } else {
+        // Asset path
         _interpreter = await Interpreter.fromAsset(modelPath, options: options);
       }
 
       // Verify model input/output shapes
       final inputShape = _interpreter.getInputTensor(0).shape;
-      final outputShape = _interpreter.getOutputTensor(0).shape;
+      final outputShape = _interpreter.getOutputTensor(0).shape; // reconstruction
 
       print('Model loaded successfully:');
       print('  Input shape: $inputShape');
@@ -93,8 +94,6 @@ class AnomalyDetectionServiceOptimized {
   /// Run warm-up inference to initialize TFLite
   Future<void> _runWarmup() async {
     print('Running warm-up inference...');
-
-    // Use float arrays - TFLite handles quantization internally
     final dummyInput = List.generate(
       1,
       (_) => List.generate(
@@ -129,7 +128,6 @@ class AnomalyDetectionServiceOptimized {
     _stopwatch.start();
 
     // Prepare output buffer (reconstruction)
-    // TFLite handles quantization/dequantization automatically
     final outputTensor = List.generate(
       1,
       (_) => List.generate(
@@ -138,7 +136,7 @@ class AnomalyDetectionServiceOptimized {
       ),
     );
 
-    // Run inference - TFLite handles INT8 conversion internally
+    // Run inference
     _interpreter.run(inputTensor, outputTensor);
 
     // Calculate MSE loss (matches Python: torch.mean((input - recon) ** 2))
