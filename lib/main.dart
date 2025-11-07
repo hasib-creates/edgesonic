@@ -1,8 +1,9 @@
 import 'dart:async';
-import 'dart:math' as math;
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:typed_data';
+import 'package:flutter/services.dart';
 
 import 'optimized/anomaly_detection_service_optimized.dart';
 import 'optimized/audio_processing_service_optimized.dart';
@@ -23,18 +24,8 @@ class EdgeSonicApp extends StatelessWidget {
     return MaterialApp(
       title: 'EdgeSonic',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.teal,
-          brightness: Brightness.light,
-        ),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
         useMaterial3: true,
-        cardTheme: CardThemeData(
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: BorderSide(color: Colors.grey.shade200),
-          ),
-        ),
       ),
       debugShowCheckedModeBanner: false,
       home: const EdgeSonicHomePage(),
@@ -59,27 +50,21 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
 
   late TabController _tabController;
 
-  // Model state
   bool _modelLoaded = false;
-  bool _isLoadingModel = false;
-  String? _loadError;
+  String? _modelPath;
 
-  // File processing state
-  String? _selectedFilePath;
-  String? _selectedFileName;
-  bool _isProcessingFile = false;
-  double _fileProgress = 0.0;
-  List<AnomalyResult>? _fileResults;
-  String? _fileError;
-
-  // Live inference state
+  // Live state
   bool _isLiveRunning = false;
   bool _liveInferenceInProgress = false;
   int _liveChunksProcessed = 0;
   AnomalyResult? _latestLiveResult;
   String? _liveError;
-  double? _liveRms;
-  DateTime? _lastLiveChunkTime;
+
+  // File state
+  String? _selectedFileName;
+  bool _isProcessingFile = false;
+  List<AnomalyResult>? _fileResults;
+  String? _fileError;
 
   @override
   void initState() {
@@ -99,42 +84,109 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
   }
 
   Future<void> _loadModel() async {
-    setState(() {
-      _isLoadingModel = true;
-      _loadError = null;
-    });
-
     try {
       final loaded = await _detector.loadModel();
       if (!mounted) return;
       setState(() {
         _modelLoaded = loaded;
-        _isLoadingModel = false;
+        _modelPath = 'assets/models/tcn_model_int8.tflite';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _modelLoaded = false);
+    }
+  }
+
+  Future<void> _pickAndLoadModel() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['tflite'],
+    );
+
+    if (result?.files.single.path == null) return;
+
+    try {
+      final path = result!.files.single.path!;
+      final file = File(path);
+      final bytes = await file.readAsBytes();
+
+      // Copy to temp location and load
+      final loaded = await _detector.loadModel(modelPath: path);
+
+      if (!mounted) return;
+      setState(() {
+        _modelLoaded = loaded;
+        _modelPath = result.files.single.name;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _modelLoaded = false);
+    }
+  }
+
+  Future<void> _pickAndProcessAudioFile() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['wav', 'mp3', 'm4a', 'flac'],
+    );
+
+    if (result?.files.single.path == null) return;
+
+    setState(() {
+      _selectedFileName = result!.files.single.name;
+      _isProcessingFile = true;
+      _fileResults = null;
+      _fileError = null;
+    });
+
+    try {
+      // Load audio file and process
+      final file = File(result.files.single.path!);
+      final bytes = await file.readAsBytes();
+
+      // Simple WAV processing (16kHz, mono assumed)
+      final results = await _processAudioBytes(bytes);
+
+      if (!mounted) return;
+      setState(() {
+        _fileResults = results;
+        _isProcessingFile = false;
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _modelLoaded = false;
-        _isLoadingModel = false;
-        _loadError = e.toString();
+        _fileError = e.toString();
+        _isProcessingFile = false;
       });
     }
   }
 
-  Future<void> _pickAudioFile() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.audio,
-      allowMultiple: false,
-    );
+  Future<List<AnomalyResult>> _processAudioBytes(Uint8List bytes) async {
+    // Skip WAV header (44 bytes)
+    final audioData = bytes.sublist(44);
 
-    if (result != null && result.files.single.path != null) {
-      setState(() {
-        _selectedFilePath = result.files.single.path;
-        _selectedFileName = result.files.single.name;
-        _fileResults = null;
-        _fileError = null;
-      });
+    // Convert to Float32
+    final samples = Float32List(audioData.length ~/ 2);
+    for (int i = 0; i < samples.length; i++) {
+      int low = audioData[i * 2];
+      int high = audioData[i * 2 + 1] << 8;
+      int sample = high | low;
+      if (sample & 0x8000 != 0) sample = sample - 0x10000;
+      samples[i] = sample / 32768.0;
     }
+
+    // Process in chunks
+    final results = <AnomalyResult>[];
+    final chunkSize = AudioProcessingServiceOptimized.samplesPerChunk;
+    final hopSize = AudioProcessingServiceOptimized.hopSamples;
+
+    for (int i = 0; i + chunkSize < samples.length; i += hopSize) {
+      final chunk = Float32List.sublistView(samples, i, i + chunkSize);
+      final result = await _detector.processAudioChunk(chunk);
+      results.add(result);
+    }
+
+    return results;
   }
 
   Future<void> _toggleLiveCapture() async {
@@ -146,10 +198,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
   }
 
   Future<void> _startLiveCapture() async {
-    if (!_modelLoaded) {
-      setState(() => _liveError = 'Model not loaded');
-      return;
-    }
+    if (!_modelLoaded) return;
 
     setState(() => _liveError = null);
 
@@ -159,7 +208,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
     if (!result.started) {
       setState(() {
         _isLiveRunning = false;
-        _liveError = result.error ?? 'Failed to start';
+        _liveError = result.error;
       });
       return;
     }
@@ -172,7 +221,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
       _handleLiveChunk,
       onError: (error) {
         if (!mounted) return;
-        setState(() => _liveError = 'Error: $error');
+        setState(() => _liveError = error.toString());
         unawaited(_stopLiveCapture());
       },
     );
@@ -181,9 +230,6 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
       _isLiveRunning = true;
       _liveChunksProcessed = 0;
       _latestLiveResult = null;
-      _liveInferenceInProgress = false;
-      _liveRms = null;
-      _lastLiveChunkTime = null;
     });
   }
 
@@ -199,11 +245,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
   }
 
   void _handleLiveChunk(LiveAudioChunk chunk) {
-    setState(() {
-      _liveChunksProcessed = _liveAudioService.chunksProcessed;
-      _liveRms = chunk.rms;
-      _lastLiveChunkTime = chunk.timestamp;
-    });
+    setState(() => _liveChunksProcessed = _liveAudioService.chunksProcessed);
 
     if (!_liveInferenceInProgress) {
       _liveInferenceInProgress = true;
@@ -221,7 +263,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
       });
     } catch (e) {
       if (!mounted) return;
-      setState(() => _liveError = 'Inference error: $e');
+      setState(() => _liveError = e.toString());
     } finally {
       _liveInferenceInProgress = false;
     }
@@ -233,13 +275,11 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
       appBar: AppBar(
         title: const Text('EdgeSonic'),
         centerTitle: true,
-        elevation: 0,
         actions: [
           IconButton(
             icon: Icon(_modelLoaded ? Icons.check_circle : Icons.error_outline),
             color: _modelLoaded ? Colors.green : Colors.red,
-            onPressed: _isLoadingModel ? null : _loadModel,
-            tooltip: _modelLoaded ? 'Model Ready' : 'Tap to reload',
+            onPressed: _pickAndLoadModel,
           ),
         ],
         bottom: TabBar(
@@ -262,485 +302,149 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
     );
   }
 
-  // ========== LIVE TAB ==========
   Widget _buildLiveTab() {
-    final theme = Theme.of(context);
     final result = _latestLiveResult;
     final isAnomaly = result?.isAnomaly ?? false;
 
-    return SingleChildScrollView(
+    return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Status Card
-          Card(
+          // Status
+          Icon(
+            _isLiveRunning ? Icons.mic : Icons.mic_off,
+            size: 80,
             color: _isLiveRunning
-                ? (isAnomaly ? Colors.red.shade50 : Colors.green.shade50)
-                : null,
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                children: [
-                  Icon(
-                    _isLiveRunning ? Icons.mic : Icons.mic_off,
-                    size: 64,
-                    color: _isLiveRunning
-                        ? (isAnomaly ? Colors.red : Colors.green)
-                        : Colors.grey,
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    _isLiveRunning ? 'LISTENING' : 'STOPPED',
-                    style: theme.textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                      color: _isLiveRunning
-                          ? (isAnomaly ? Colors.red : Colors.green)
-                          : Colors.grey,
-                    ),
-                  ),
-                  if (result != null && _isLiveRunning) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      isAnomaly ? '⚠️ ANOMALY DETECTED' : '✓ Normal',
-                      style: theme.textTheme.titleMedium?.copyWith(
-                        color: isAnomaly ? Colors.red : Colors.green,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
+                ? (isAnomaly ? Colors.red : Colors.green)
+                : Colors.grey,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            _isLiveRunning ? (isAnomaly ? 'ANOMALY' : 'NORMAL') : 'STOPPED',
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+              color: _isLiveRunning
+                  ? (isAnomaly ? Colors.red : Colors.green)
+                  : Colors.grey,
             ),
           ),
 
-          const SizedBox(height: 16),
+          const SizedBox(height: 24),
 
-          // Metrics Grid
-          if (_isLiveRunning) ...[
+          // Metrics
+          if (_isLiveRunning && result != null) ...[
             Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                Expanded(
-                  child: _buildMetricCard(
-                    'Chunks',
-                    '$_liveChunksProcessed',
-                    Icons.analytics,
-                    Colors.blue,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _buildMetricCard(
-                    'RMS',
-                    _liveRms?.toStringAsFixed(3) ?? '---',
-                    Icons.graphic_eq,
-                    Colors.purple,
-                  ),
-                ),
+                _buildMetric('Chunks', '$_liveChunksProcessed'),
+                _buildMetric('Score', result.smoothedScore.toStringAsFixed(4)),
+                _buildMetric('Latency', '${result.processingTimeMs.toStringAsFixed(0)}ms'),
               ],
             ),
-            const SizedBox(height: 12),
-            if (result != null) ...[
-              Row(
-                children: [
-                  Expanded(
-                    child: _buildMetricCard(
-                      'Score',
-                      result.smoothedScore.toStringAsFixed(4),
-                      Icons.score,
-                      isAnomaly ? Colors.red : Colors.green,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _buildMetricCard(
-                      'Latency',
-                      '${result.processingTimeMs.toStringAsFixed(1)}ms',
-                      Icons.speed,
-                      Colors.orange,
-                    ),
-                  ),
-                ],
-              ),
-            ],
-            const SizedBox(height: 20),
+            const SizedBox(height: 24),
           ],
 
-          // Control Button
+          // Control
           FilledButton.icon(
             onPressed: _modelLoaded ? _toggleLiveCapture : null,
             icon: Icon(_isLiveRunning ? Icons.stop : Icons.play_arrow),
-            label: Text(
-              _isLiveRunning ? 'Stop Capture' : 'Start Live Capture',
-              style: const TextStyle(fontSize: 16),
-            ),
+            label: Text(_isLiveRunning ? 'Stop' : 'Start'),
             style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(vertical: 16),
+              minimumSize: const Size(200, 48),
               backgroundColor: _isLiveRunning ? Colors.red : null,
             ),
           ),
 
-          // Error Display
           if (_liveError != null) ...[
             const SizedBox(height: 16),
-            Card(
-              color: Colors.red.shade50,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Row(
-                  children: [
-                    Icon(Icons.error, color: Colors.red.shade700),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        _liveError!,
-                        style: TextStyle(color: Colors.red.shade700),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-
-          // Info Card
-          if (!_isLiveRunning && _liveError == null) ...[
-            const SizedBox(height: 16),
-            Card(
-              color: Colors.blue.shade50,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(Icons.info_outline, color: Colors.blue.shade700),
-                        const SizedBox(width: 8),
-                        Text(
-                          'How it works',
-                          style: TextStyle(
-                            color: Colors.blue.shade700,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      '• Captures audio at 16kHz\n'
-                      '• Analyzes 128-frame windows\n'
-                      '• Detects anomalies in real-time\n'
-                      '• 5-15ms latency',
-                      style: TextStyle(
-                        color: Colors.blue.shade700,
-                        fontSize: 13,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
+            Text(_liveError!, style: const TextStyle(color: Colors.red)),
           ],
         ],
       ),
     );
   }
 
-  Widget _buildMetricCard(String label, String value, IconData icon, Color color) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Icon(icon, color: color, size: 28),
+  Widget _buildMetric(String label, String value) {
+    return Column(
+      children: [
+        Text(value, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+        Text(label, style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+      ],
+    );
+  }
+
+  Widget _buildFileTab() {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          const SizedBox(height: 20),
+
+          if (_selectedFileName != null) ...[
+            Text(_selectedFileName!, style: const TextStyle(fontWeight: FontWeight.w500)),
+            const SizedBox(height: 16),
+          ],
+
+          FilledButton.icon(
+            onPressed: _isProcessingFile ? null : _pickAndProcessAudioFile,
+            icon: const Icon(Icons.upload_file),
+            label: const Text('Select & Process'),
+            style: FilledButton.styleFrom(minimumSize: const Size(200, 48)),
+          ),
+
+          const SizedBox(height: 24),
+
+          if (_isProcessingFile)
+            const CircularProgressIndicator(),
+
+          if (_fileResults != null) ...[
+            Text(
+              '${_fileResults!.length} chunks processed',
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 8),
             Text(
-              value,
-              style: TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-                color: color,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12,
-                color: Colors.grey.shade600,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // ========== FILE TAB ==========
-  Widget _buildFileTab() {
-    final theme = Theme.of(context);
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // File Selection Card
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(Icons.audio_file, color: theme.colorScheme.primary),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Audio File Processing',
-                        style: theme.textTheme.titleLarge,
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  if (_selectedFileName != null) ...[
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.grey.shade100,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.audio_file, size: 20),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              _selectedFileName!,
-                              style: const TextStyle(fontWeight: FontWeight.w500),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                  ],
-                  FilledButton.icon(
-                    onPressed: _isProcessingFile ? null : _pickAudioFile,
-                    icon: const Icon(Icons.folder_open),
-                    label: const Text('Select Audio File'),
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                    ),
-                  ),
-                  if (_selectedFilePath != null) ...[
-                    const SizedBox(height: 12),
-                    OutlinedButton.icon(
-                      onPressed: null, // TODO: Implement file processing
-                      icon: const Icon(Icons.play_arrow),
-                      label: const Text('Process (Coming Soon)'),
-                      style: OutlinedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-
-          if (_isProcessingFile) ...[
-            const SizedBox(height: 16),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  children: [
-                    CircularProgressIndicator(value: _fileProgress),
-                    const SizedBox(height: 12),
-                    Text('Processing: ${(_fileProgress * 100).toStringAsFixed(0)}%'),
-                  ],
-                ),
-              ),
+              '${_fileResults!.where((r) => r.isAnomaly).length} anomalies detected',
+              style: const TextStyle(color: Colors.red),
             ),
           ],
 
-          if (_fileError != null) ...[
-            const SizedBox(height: 16),
-            Card(
-              color: Colors.orange.shade50,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Row(
-                  children: [
-                    Icon(Icons.info, color: Colors.orange.shade700),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        _fileError!,
-                        style: TextStyle(color: Colors.orange.shade700),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-
-          // Info Card
-          const SizedBox(height: 16),
-          Card(
-            color: Colors.blue.shade50,
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(Icons.info_outline, color: Colors.blue.shade700),
-                      const SizedBox(width: 8),
-                      Text(
-                        'File Processing',
-                        style: TextStyle(
-                          color: Colors.blue.shade700,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Upload audio files to analyze for anomalies offline. '
-                    'Results will be displayed with timestamps and exportable to CSV.',
-                    style: TextStyle(
-                      color: Colors.blue.shade700,
-                      fontSize: 13,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
+          if (_fileError != null)
+            Text(_fileError!, style: const TextStyle(color: Colors.red)),
         ],
       ),
     );
   }
 
-  // ========== MQTT TAB ==========
   Widget _buildMqttTab() {
-    final theme = Theme.of(context);
-    return SingleChildScrollView(
+    return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(Icons.router, color: theme.colorScheme.primary, size: 32),
-                      const SizedBox(width: 12),
-                      Text(
-                        'MQTT Integration',
-                        style: theme.textTheme.titleLarge,
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  Text(
-                    'Connect to your MQTT broker to receive telemetry '
-                    'or simulate ESP32 device payloads.',
-                    style: theme.textTheme.bodyMedium,
-                  ),
-                  const SizedBox(height: 20),
-                  FilledButton.icon(
-                    onPressed: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => const MqttTestPage()),
-                      );
-                    },
-                    icon: const Icon(Icons.wifi_tethering),
-                    label: const Text('MQTT Connection Test'),
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  OutlinedButton.icon(
-                    onPressed: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(builder: (_) => const MqttSimulatorPage()),
-                      );
-                    },
-                    icon: const Icon(Icons.sensors),
-                    label: const Text('ESP32 Simulator'),
-                    style: OutlinedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                    ),
-                  ),
-                ],
-              ),
-            ),
+          FilledButton.icon(
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const MqttTestPage()),
+              );
+            },
+            icon: const Icon(Icons.wifi_tethering),
+            label: const Text('MQTT Test'),
+            style: FilledButton.styleFrom(minimumSize: const Size(200, 48)),
           ),
-
           const SizedBox(height: 16),
-
-          // Features Card
-          Card(
-            color: Colors.green.shade50,
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(Icons.check_circle, color: Colors.green.shade700),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Features',
-                        style: TextStyle(
-                          color: Colors.green.shade700,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 16,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  _buildFeatureItem('Connect to any MQTT broker'),
-                  _buildFeatureItem('Subscribe to topics'),
-                  _buildFeatureItem('Publish anomaly results'),
-                  _buildFeatureItem('Simulate ESP32 telemetry'),
-                  _buildFeatureItem('Real-time message monitoring'),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildFeatureItem(String text) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        children: [
-          Icon(Icons.check, color: Colors.green.shade700, size: 18),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              text,
-              style: TextStyle(color: Colors.green.shade700),
-            ),
+          OutlinedButton.icon(
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const MqttSimulatorPage()),
+              );
+            },
+            icon: const Icon(Icons.sensors),
+            label: const Text('ESP32 Simulator'),
+            style: OutlinedButton.styleFrom(minimumSize: const Size(200, 48)),
           ),
         ],
       ),
