@@ -3,13 +3,11 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:typed_data';
-import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'optimized/anomaly_detection_service_optimized.dart';
 import 'optimized/audio_processing_service_optimized.dart';
 import 'services/live_audio_service_optimized.dart';
-import 'pages/mqtt_test_page.dart';
-import 'pages/mqtt_simulator_page.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -51,6 +49,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
   late TabController _tabController;
 
   bool _modelLoaded = false;
+  String? _modelName;
   String? _modelPath;
 
   // Live state
@@ -69,8 +68,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
-    _loadModel();
+    _tabController = TabController(length: 2, vsync: this);
   }
 
   @override
@@ -83,20 +81,6 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
     super.dispose();
   }
 
-  Future<void> _loadModel() async {
-    try {
-      final loaded = await _detector.loadModel();
-      if (!mounted) return;
-      setState(() {
-        _modelLoaded = loaded;
-        _modelPath = 'assets/models/tcn_model_int8.tflite';
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _modelLoaded = false);
-    }
-  }
-
   Future<void> _pickAndLoadModel() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -106,21 +90,47 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
     if (result?.files.single.path == null) return;
 
     try {
-      final path = result!.files.single.path!;
-      final file = File(path);
-      final bytes = await file.readAsBytes();
+      final sourcePath = result!.files.single.path!;
 
-      // Copy to temp location and load
-      final loaded = await _detector.loadModel(modelPath: path);
+      // Copy model to app's document directory for persistent access
+      final appDir = await getApplicationDocumentsDirectory();
+      final targetPath = '${appDir.path}/model.tflite';
+
+      final sourceFile = File(sourcePath);
+      await sourceFile.copy(targetPath);
+
+      // Load the model
+      final loaded = await _detector.loadModel(modelPath: targetPath);
 
       if (!mounted) return;
       setState(() {
         _modelLoaded = loaded;
-        _modelPath = result.files.single.name;
+        _modelName = result.files.single.name;
+        _modelPath = targetPath;
       });
     } catch (e) {
       if (!mounted) return;
-      setState(() => _modelLoaded = false);
+      setState(() {
+        _modelLoaded = false;
+        _modelName = null;
+      });
+
+      // Show error dialog
+      if (mounted) {
+        showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Error'),
+            content: Text('Failed to load model: $e'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        );
+      }
     }
   }
 
@@ -140,11 +150,10 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
     });
 
     try {
-      // Load audio file and process
       final file = File(result.files.single.path!);
       final bytes = await file.readAsBytes();
 
-      // Simple WAV processing (16kHz, mono assumed)
+      // Process audio
       final results = await _processAudioBytes(bytes);
 
       if (!mounted) return;
@@ -273,30 +282,56 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('EdgeSonic'),
+        title: Text(_modelLoaded ? _modelName ?? 'EdgeSonic' : 'EdgeSonic'),
         centerTitle: true,
         actions: [
           IconButton(
-            icon: Icon(_modelLoaded ? Icons.check_circle : Icons.error_outline),
-            color: _modelLoaded ? Colors.green : Colors.red,
+            icon: Icon(_modelLoaded ? Icons.check_circle : Icons.upload),
+            color: _modelLoaded ? Colors.green : Colors.grey,
             onPressed: _pickAndLoadModel,
+            tooltip: 'Upload Model',
           ),
         ],
-        bottom: TabBar(
-          controller: _tabController,
-          tabs: const [
-            Tab(icon: Icon(Icons.mic), text: 'Live'),
-            Tab(icon: Icon(Icons.upload_file), text: 'File'),
-            Tab(icon: Icon(Icons.router), text: 'MQTT'),
-          ],
-        ),
+        bottom: _modelLoaded
+            ? TabBar(
+                controller: _tabController,
+                tabs: const [
+                  Tab(icon: Icon(Icons.mic), text: 'Live'),
+                  Tab(icon: Icon(Icons.upload_file), text: 'File'),
+                ],
+              )
+            : null,
       ),
-      body: TabBarView(
-        controller: _tabController,
+      body: _modelLoaded
+          ? TabBarView(
+              controller: _tabController,
+              children: [
+                _buildLiveTab(),
+                _buildFileTab(),
+              ],
+            )
+          : _buildUploadPrompt(),
+    );
+  }
+
+  Widget _buildUploadPrompt() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          _buildLiveTab(),
-          _buildFileTab(),
-          _buildMqttTab(),
+          Icon(Icons.upload_file, size: 80, color: Colors.grey.shade400),
+          const SizedBox(height: 24),
+          const Text(
+            'Upload TFLite Model',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 32),
+          FilledButton.icon(
+            onPressed: _pickAndLoadModel,
+            icon: const Icon(Icons.upload),
+            label: const Text('Select Model'),
+            style: FilledButton.styleFrom(minimumSize: const Size(200, 48)),
+          ),
         ],
       ),
     );
@@ -310,7 +345,6 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
       padding: const EdgeInsets.all(16),
       child: Column(
         children: [
-          // Status
           Icon(
             _isLiveRunning ? Icons.mic : Icons.mic_off,
             size: 80,
@@ -329,25 +363,21 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
                   : Colors.grey,
             ),
           ),
-
           const SizedBox(height: 24),
-
-          // Metrics
           if (_isLiveRunning && result != null) ...[
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
                 _buildMetric('Chunks', '$_liveChunksProcessed'),
                 _buildMetric('Score', result.smoothedScore.toStringAsFixed(4)),
-                _buildMetric('Latency', '${result.processingTimeMs.toStringAsFixed(0)}ms'),
+                _buildMetric('Latency',
+                    '${result.processingTimeMs.toStringAsFixed(0)}ms'),
               ],
             ),
             const SizedBox(height: 24),
           ],
-
-          // Control
           FilledButton.icon(
-            onPressed: _modelLoaded ? _toggleLiveCapture : null,
+            onPressed: _toggleLiveCapture,
             icon: Icon(_isLiveRunning ? Icons.stop : Icons.play_arrow),
             label: Text(_isLiveRunning ? 'Stop' : 'Start'),
             style: FilledButton.styleFrom(
@@ -355,7 +385,6 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
               backgroundColor: _isLiveRunning ? Colors.red : null,
             ),
           ),
-
           if (_liveError != null) ...[
             const SizedBox(height: 16),
             Text(_liveError!, style: const TextStyle(color: Colors.red)),
@@ -368,8 +397,10 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
   Widget _buildMetric(String label, String value) {
     return Column(
       children: [
-        Text(value, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-        Text(label, style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+        Text(value,
+            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+        Text(label,
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
       ],
     );
   }
@@ -380,72 +411,32 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
       child: Column(
         children: [
           const SizedBox(height: 20),
-
           if (_selectedFileName != null) ...[
-            Text(_selectedFileName!, style: const TextStyle(fontWeight: FontWeight.w500)),
+            Text(_selectedFileName!,
+                style: const TextStyle(fontWeight: FontWeight.w500)),
             const SizedBox(height: 16),
           ],
-
           FilledButton.icon(
             onPressed: _isProcessingFile ? null : _pickAndProcessAudioFile,
             icon: const Icon(Icons.upload_file),
             label: const Text('Select & Process'),
             style: FilledButton.styleFrom(minimumSize: const Size(200, 48)),
           ),
-
           const SizedBox(height: 24),
-
-          if (_isProcessingFile)
-            const CircularProgressIndicator(),
-
+          if (_isProcessingFile) const CircularProgressIndicator(),
           if (_fileResults != null) ...[
             Text(
-              '${_fileResults!.length} chunks processed',
+              '${_fileResults!.length} chunks',
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
             Text(
-              '${_fileResults!.where((r) => r.isAnomaly).length} anomalies detected',
-              style: const TextStyle(color: Colors.red),
+              '${_fileResults!.where((r) => r.isAnomaly).length} anomalies',
+              style: const TextStyle(color: Colors.red, fontSize: 16),
             ),
           ],
-
           if (_fileError != null)
             Text(_fileError!, style: const TextStyle(color: Colors.red)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildMqttTab() {
-    return Padding(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          FilledButton.icon(
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const MqttTestPage()),
-              );
-            },
-            icon: const Icon(Icons.wifi_tethering),
-            label: const Text('MQTT Test'),
-            style: FilledButton.styleFrom(minimumSize: const Size(200, 48)),
-          ),
-          const SizedBox(height: 16),
-          OutlinedButton.icon(
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const MqttSimulatorPage()),
-              );
-            },
-            icon: const Icon(Icons.sensors),
-            label: const Text('ESP32 Simulator'),
-            style: OutlinedButton.styleFrom(minimumSize: const Size(200, 48)),
-          ),
         ],
       ),
     );
