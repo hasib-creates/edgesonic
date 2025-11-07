@@ -150,7 +150,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
     });
 
     try {
-      final file = File(result.files.single.path!);
+      final file = File(result!.files.single.path!);
       final bytes = await file.readAsBytes();
 
       // Process audio
