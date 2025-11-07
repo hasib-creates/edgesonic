@@ -85,29 +85,34 @@ class AnomalyDetectionServiceOptimized {
 
   /// Run warm-up inference to initialize TFLite
   Future<void> _runWarmup() async {
-    print('Running warm-up inference...');
-    final dummyInput = List.generate(
-      1,
-      (_) => List.generate(
-        AudioConfig.numMelBins,
-        (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
-      ),
-    );
-    
-    final dummyOutput = List.generate(
-      1,
-      (_) => List.generate(
-        AudioConfig.numMelBins,
-        (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
-      ),
-    );
-    
-    _stopwatch.start();
-    _interpreter.run(dummyInput, dummyOutput);
-    _stopwatch.stop();
-    
-    print('  Warm-up inference time: ${_stopwatch.elapsedMilliseconds}ms');
-    _stopwatch.reset();
+    try {
+      print('Running warm-up inference...');
+      final dummyInput = List.generate(
+        1,
+        (_) => List.generate(
+          AudioConfig.numMelBins,
+          (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
+        ),
+      );
+
+      final dummyOutput = List.generate(
+        1,
+        (_) => List.generate(
+          AudioConfig.numMelBins,
+          (_) => List.generate(AudioConfig.targetLength, (_) => 0.0),
+        ),
+      );
+
+      _stopwatch.start();
+      _interpreter.run(dummyInput, dummyOutput);
+      _stopwatch.stop();
+
+      print('  Warm-up inference time: ${_stopwatch.elapsedMilliseconds}ms');
+      _stopwatch.reset();
+    } catch (e) {
+      print('  Warm-up failed: $e');
+      rethrow;
+    }
   }
 
   /// Run inference and calculate anomaly score

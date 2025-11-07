@@ -97,47 +97,77 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
       allowedExtensions: ['tflite'],
     );
 
-    if (result?.files.single.path == null) return;
+    if (result?.files.single.path == null) {
+      print('No file selected');
+      return;
+    }
 
     try {
       final sourcePath = result!.files.single.path!;
+      print('Selected model: $sourcePath');
 
       // Copy model to app's document directory for persistent access
       final appDir = await getApplicationDocumentsDirectory();
       final targetPath = '${appDir.path}/model.tflite';
+      print('Copying to: $targetPath');
 
       final sourceFile = File(sourcePath);
       await sourceFile.copy(targetPath);
+      print('Model copied successfully');
+
+      // Verify file exists
+      final targetFile = File(targetPath);
+      final exists = await targetFile.exists();
+      print('Model file exists: $exists');
+
+      if (!exists) {
+        throw Exception('Model file not found after copy');
+      }
 
       // Load the model
+      print('Loading model...');
       final loaded = await _detector.loadModel(modelPath: targetPath);
+      print('Model loaded: $loaded');
 
       if (!mounted) return;
-      setState(() {
-        _modelLoaded = loaded;
-        _modelName = result.files.single.name;
-        _modelPath = targetPath;
-      });
-    } catch (e) {
+
+      if (loaded) {
+        setState(() {
+          _modelLoaded = true;
+          _modelName = result.files.single.name;
+          _modelPath = targetPath;
+        });
+
+        // Show success message
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Model loaded successfully!'),
+              backgroundColor: Colors.green,
+              duration: Duration(seconds: 2),
+            ),
+          );
+        }
+      } else {
+        throw Exception(_detector.lastError ?? 'Unknown error loading model');
+      }
+    } catch (e, stackTrace) {
+      print('Error loading model: $e');
+      print('Stack trace: $stackTrace');
+
       if (!mounted) return;
       setState(() {
         _modelLoaded = false;
         _modelName = null;
       });
 
-      // Show error dialog
+      // Show error message
       if (mounted) {
-        showDialog(
-          context: context,
-          builder: (context) => AlertDialog(
-            title: const Text('Error'),
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
             content: Text('Failed to load model: $e'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('OK'),
-              ),
-            ],
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 4),
           ),
         );
       }
