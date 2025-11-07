@@ -104,7 +104,7 @@ class AnomalyDetectionServiceOptimized {
       dynamic dummyInput;
       dynamic dummyOutput;
 
-      if (inputType.toString().contains('int8')) {
+      if (inputType == TensorType.int8 || inputType.toString().toLowerCase().contains('int8')) {
         // For INT8 quantized model, use Int8List
         final inputSize = 1 * AudioConfig.numMelBins * AudioConfig.targetLength;
         dummyInput = Int8List(inputSize);
@@ -160,7 +160,7 @@ class AnomalyDetectionServiceOptimized {
     dynamic modelOutput;
     List<List<double>> dequantizedOutput;
 
-    if (inputType.toString().contains('int8')) {
+    if (inputType == TensorType.int8 || inputType.toString().toLowerCase().contains('int8')) {
       // INT8 quantized model - need to quantize input
       final inputParams = inputTensorInfo.params;
       final inputScale = inputParams.scale;
