@@ -1,0 +1,16 @@
+dependencies:
+  flutter:
+    sdk: flutter
+
+  tflite_flutter: ^0.10.4
+  mqtt_client: ^10.3.0
+  
+  # Add these new dependencies for audio processing
+  file_picker: ^6.1.1
+  just_audio: ^0.9.36
+  fftea: ^1.0.0  # For FFT/Mel spectrogram computation
+  fl_chart: ^0.65.0  # For visualizing anomaly scores
+  path_provider: ^2.1.1
+  permission_handler: ^11.1.0  # For microphone permissions if needed later
+
+  cupertino_icons: ^1.0.2

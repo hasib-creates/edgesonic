@@ -1,0 +1,5 @@
+{
+  "svdd_threshold": 1.5,
+  "mse_threshold": 0.2,
+  "svdd_center": []
+}

@@ -1,0 +1,9 @@
+{
+  "clips": [
+    {
+      "path": "../long_mix_50s.wav",
+      "label": "long_mix",
+      "threshold": 0.3
+    }
+  ]
+}
