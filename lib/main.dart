@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
@@ -8,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import 'optimized/anomaly_detection_service_optimized.dart';
 import 'optimized/audio_processing_service_optimized.dart';
 import 'services/live_audio_service_optimized.dart';
+import 'services/mqtt_service.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -65,10 +67,16 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
   List<AnomalyResult>? _fileResults;
   String? _fileError;
 
+  // MQTT state
+  final _brokerController = TextEditingController(text: '10.8.0.1');
+  final _hwIdController = TextEditingController(text: 'ABCD');
+  bool _isSendingMqtt = false;
+  String? _mqttStatus;
+
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
   }
 
   @override
@@ -78,6 +86,8 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
     _liveAudioService.dispose();
     _detector.dispose();
     _tabController.dispose();
+    _brokerController.dispose();
+    _hwIdController.dispose();
     super.dispose();
   }
 
@@ -298,6 +308,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
                 tabs: const [
                   Tab(icon: Icon(Icons.mic), text: 'Live'),
                   Tab(icon: Icon(Icons.upload_file), text: 'File'),
+                  Tab(icon: Icon(Icons.cloud_upload), text: 'MQTT'),
                 ],
               )
             : null,
@@ -308,6 +319,7 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
               children: [
                 _buildLiveTab(),
                 _buildFileTab(),
+                _buildMqttTab(),
               ],
             )
           : _buildUploadPrompt(),
@@ -440,5 +452,97 @@ class _EdgeSonicHomePageState extends State<EdgeSonicHomePage>
         ],
       ),
     );
+  }
+
+  Widget _buildMqttTab() {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          const SizedBox(height: 20),
+          TextField(
+            controller: _brokerController,
+            decoration: const InputDecoration(
+              labelText: 'Broker',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _hwIdController,
+            decoration: const InputDecoration(
+              labelText: 'Hardware ID',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 24),
+          FilledButton.icon(
+            onPressed: _isSendingMqtt ? null : _sendMqttData,
+            icon: const Icon(Icons.send),
+            label: Text(_isSendingMqtt ? 'Sending...' : 'Send'),
+            style: FilledButton.styleFrom(minimumSize: const Size(200, 48)),
+          ),
+          const SizedBox(height: 16),
+          if (_mqttStatus != null)
+            Text(
+              _mqttStatus!,
+              style: TextStyle(
+                color: _mqttStatus!.contains('Error') ? Colors.red : Colors.green,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _sendMqttData() async {
+    final broker = _brokerController.text.trim();
+    final hwId = _hwIdController.text.trim();
+
+    if (broker.isEmpty || hwId.isEmpty) {
+      setState(() => _mqttStatus = 'Error: Broker and HW ID required');
+      return;
+    }
+
+    setState(() {
+      _isSendingMqtt = true;
+      _mqttStatus = null;
+    });
+
+    final deviceId = 'edgesonic-${hwId.toLowerCase()}';
+    final mqtt = MQTTService(
+      broker: broker,
+      clientId: 'EdgeSonic-$hwId',
+    );
+
+    try {
+      await mqtt.connect();
+
+      final result = _latestLiveResult;
+      final now = DateTime.now().millisecondsSinceEpoch;
+
+      final telemetryPayload = {
+        'mse': result?.smoothedScore.toStringAsFixed(4) ?? '0.0',
+        'anomaly': result?.isAnomaly ?? false,
+        'hwId': hwId,
+        'ts': now,
+      };
+
+      await mqtt.publishString(
+        topic: 'sensors/$deviceId/telemetry',
+        payload: jsonEncode(telemetryPayload),
+      );
+
+      if (!mounted) return;
+      setState(() => _mqttStatus = 'Sent successfully');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _mqttStatus = 'Error: $e');
+    } finally {
+      mqtt.disconnect();
+      if (mounted) {
+        setState(() => _isSendingMqtt = false);
+      }
+    }
   }
 }
