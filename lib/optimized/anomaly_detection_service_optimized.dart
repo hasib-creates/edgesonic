@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'audio_processing_service_optimized.dart';
@@ -56,7 +57,10 @@ class AnomalyDetectionServiceOptimized {
   Future<bool> loadModel({String modelPath = 'assets/models/tcn_model_int8.tflite'}) async {
     try {
       final options = InterpreterOptions()..threads = 2;
-      _interpreter = await Interpreter.fromAsset(modelPath, options: options);
+      _interpreter = await Interpreter.fromFile(
+        File(modelPath),
+        options: options,
+      );
       
       // Verify model input/output shapes
       final inputShape = _interpreter.getInputTensor(0).shape;
