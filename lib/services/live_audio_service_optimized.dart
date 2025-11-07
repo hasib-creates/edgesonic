@@ -5,7 +5,7 @@ import 'dart:typed_data';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:sound_stream/sound_stream.dart';
 
-import '../../optimized/audio_processing_service_optimized.dart';
+import '../optimized/audio_processing_service_optimized.dart';
 
 class LiveAudioChunk {
   LiveAudioChunk({

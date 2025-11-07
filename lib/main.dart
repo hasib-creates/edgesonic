@@ -4,8 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:typed_data';
 
-import '../optimized/anomaly_detection_service_optimized.dart';
-import '../optimized/audio_processing_service_optimized.dart';
+import 'optimized/anomaly_detection_service_optimized.dart';
+import 'optimized/audio_processing_service_optimized.dart';
 import 'services/live_audio_service_optimized.dart';
 import 'pages/mqtt_test_page.dart';
 import 'pages/mqtt_simulator_page.dart';
